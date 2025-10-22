@@ -5,7 +5,7 @@
 linkllm/
 ├── libraries/
 │   ├── python/
-│   │   ├── llm_link/               → Core SDK
+│   │   ├── link_llm/               → Core SDK
 │   │   │   ├── protocol.py         → JSON schema & message spec
 │   │   │   ├── client.py           → Client to connect to Bus / other agents
 │   │   │   ├── bridge.py           → WebSocket/HTTP connector
