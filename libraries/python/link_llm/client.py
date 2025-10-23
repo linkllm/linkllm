@@ -4,8 +4,8 @@
 # Implements: reliable send, receive loop, handler routing, middleware, reconnect,
 #            batching, backpressure, metrics, tracing integration hooks, and sync wrappers.
 # ------------------------------------------------------------
-from .protocol import LinkMessage, MessageType, Role, LinkHeader
 from __future__ import annotations
+from .protocol import LinkMessage, MessageType, Role, LinkHeader
 import asyncio
 import logging
 import time
