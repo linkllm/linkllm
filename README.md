@@ -29,3 +29,39 @@ linkllm/
 └── README.md
 
 ```
+
+## architecture flow:
+
+```
++------------------+
+|   Agent Client   |   →  link_llm.client.Client
+|------------------|
+| - Handles async send/recv
+| - Middleware, routing
+| - Heartbeat, retry
++------------------+
+          |
+          v
++------------------+
+|     Bridge       |   →  link_llm.bridge.*
+|------------------|
+| - WebSocket / HTTP / InMemory
+| - Handles transport + reconnect
++------------------+
+          |
+          v
++------------------+
+|   Message Bus    |   →  server.bus / registry
+|------------------|
+| - Routes messages between agents
+| - Stores shared memory/context
++------------------+
+          |
+          v
++------------------+
+|   LLM Agents     |
+|------------------|
+| - Writer, Analyzer, Critic etc.
++------------------+
+
+```
