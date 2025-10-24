@@ -244,3 +244,5 @@ class WebsocketBridge:
             logger.error(f"[{self.agent_id}] Failed to serialize or send: {e}")
 
         return False
+# Define what is exposed when `from .bridge import *` is used
+__all__ = ["WebsocketBridge", "MessageCallback"]
