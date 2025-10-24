@@ -1,412 +1,246 @@
-# bridge.py — Transport Layer for LinkLLM
-# ------------------------------------------------------------
-# Provides a robust, production-ready Bridge abstraction and concrete
-# implementations for WebSocket, HTTP, and In-Memory transports.
-#
-# Features:
-# - BaseBridge abstract interface
-# - WebSocketClientBridge with auto-reconnect, ping/pong, backoff
-# - HttpBridge with bg long-polling and post messages
-# - InMemoryBridge for local testing (per-agent endpoints)
-# - Pluggable serializer/deserializer hooks
-# - Optional authentication header support (Bearer / JWT / Capability tokens)
-# - Metrics and basic tracing hooks
-# - Clean async context manager support
-#
-# Notes:
-# - Requires `websockets` for WebSocket transport and `aiohttp` for HTTP transport.
-# - This file focuses on correctness and clarity over extreme micro-optimizations.
-# ------------------------------------------------------------
-from __future__ import annotations
+"""
+link_llm.bridge
+~~~~~~~~~~~~~~~
+
+This module implements the low-level communication bridge.
+It handles the raw WebSocket connection, JSON serialization/deserialization,
+and automatic reconnection logic.
+
+The bridge is designed to be a reliable transport layer that the
+high-level `LinkClient` can use without worrying about connection
+drops or network errors.
+"""
+
 import asyncio
 import json
 import logging
-import time
-from typing import Any, Callable, Dict, Optional, Awaitable
-from websockets import WebSocketClientProtocol
-logger = logging.getLogger("link_llm.bridge")
+from typing import AsyncGenerator, Callable, Coroutine, Optional
 
-
-class BridgeError(Exception):
-    """Generic bridge error"""
-
-
-class BaseBridge:
-    """Abstract base interface for a Bridge implementation.
-
-    Implementations must provide async `send`, `recv`, and `close`. Optional
-    `connect` may be provided for transports that require an initial handshake.
-    """
-
-    async def connect(self) -> None:
-        raise NotImplementedError
-
-    async def send(self, msg: Dict[str, Any]) -> Any:
-        raise NotImplementedError
-
-    async def recv(self) -> Optional[Dict[str, Any]]:
-        raise NotImplementedError
-
-    async def close(self) -> None:
-        raise NotImplementedError
-
-    # Optional hooks
-    def serializer(self, obj: Dict[str, Any]) -> str:
-        return json.dumps(obj, default=str)
-
-    def deserializer(self, raw: str) -> Dict[str, Any]:
-        return json.loads(raw)
-
-
-# ---------------------------
-# WebSocket Bridge
-# ---------------------------
+# We will use the 'websockets' library for client connections
 try:
     import websockets
-    from websockets import WebSocketClientProtocol
-except Exception:
-    websockets = None
-    WebSocketClientProtocol = Any
+    from websockets.client import WebSocketClientProtocol
+    from websockets.exceptions import ConnectionClosed, WebSocketException
+except ImportError:
+    print("Websockets library not installed. Please run 'pip install websockets'")
+    raise
+
+from .protocol import (
+    LinkMessage,
+    parse_message,
+    serialize_message,
+    ValidationError
+)
+
+# Set up a logger for this module
+logger = logging.getLogger(__name__)
+
+# Type hint for the message handling callback
+# The handler must be a coroutine that accepts a LinkMessage
+MessageCallback = Callable[[LinkMessage], Coroutine[None, None, None]]
 
 
-class WebSocketClientBridge(BaseBridge):
-    """Asynchronous WebSocket bridge with reconnect and ping/pong support.
+class WebsocketBridge:
+    """
+    Manages the WebSocket connection to the LLM-Link Context Bus.
 
-    Basic usage:
-        bridge = WebSocketClientBridge('ws://localhost:8765', auth_token='...')
-        await bridge.connect()
-        await bridge.send({...})
-        msg = await bridge.recv()
+    This class provides:
+    - Connection and disconnection logic.
+    - Automatic reconnection with exponential backoff.
+    - A `send` method to send `LinkMessage` objects (as JSON).
+    - A `listen` method that continuously receives messages and
+      passes them to a registered callback.
     """
 
     def __init__(
         self,
-        url: str,
-        auth_token: Optional[str] = None,
-        ping_interval: float = 20.0,
-        max_message_size: int = 2 ** 20,
-        reconnect_backoff: float = 0.5,
-        max_backoff: float = 30.0,
-        loop: Optional[asyncio.AbstractEventLoop] = None,
+        agent_id: str,
+        uri: str,
+        on_message: MessageCallback,
+        on_connect: Optional[Callable[[], Coroutine[None, None, None]]] = None,
+        max_retry_delay: int = 60,
+        initial_retry_delay: int = 1,
     ):
-        if websockets is None:
-            raise BridgeError("websockets library not installed. `pip install websockets`")
+        """
+        Initializes the WebsocketBridge.
 
-        self.url = url
-        self.auth_token = auth_token
-        self.ping_interval = ping_interval
-        self.max_message_size = max_message_size
-        self.reconnect_backoff = reconnect_backoff
-        self.max_backoff = max_backoff
-        self.loop = loop or asyncio.get_event_loop()
-
-        self._ws: Optional[WebSocketClientProtocol] = None  # Yellow underline at WebSocketClientProtocol
-        self._connected = asyncio.Event()
-        self._recv_queue: asyncio.Queue = asyncio.Queue()
-        self._send_lock = asyncio.Lock()
-        self._listener_task: Optional[asyncio.Task] = None
-        self._pinger_task: Optional[asyncio.Task] = None
-        self._closing = False
-
-    async def connect(self) -> None:
-        backoff = self.reconnect_backoff
-        while True:
-            try:
-                headers = []
-                if self.auth_token:
-                    headers.append(("Authorization", f"Bearer {self.auth_token}"))
-                self._ws = await websockets.connect(self.url, max_size=self.max_message_size, extra_headers=headers)
-                self._connected.set()
-                logger.info("WebSocket connected: %s", self.url)
-                # start background listener and pinger
-                self._listener_task = self.loop.create_task(self._listener())
-                self._pinger_task = self.loop.create_task(self._pinger())
-                return
-            except Exception as e:
-                logger.warning("WebSocket connect failed: %s — retrying in %.1fs", e, backoff)
-                await asyncio.sleep(backoff)
-                backoff = min(self.max_backoff, backoff * 2)
-
-    async def send(self, msg: Dict[str, Any]) -> Any:
-        await self._connected.wait()
-        async with self._send_lock:
-            raw = self.serializer(msg)
-            try:
-                await asyncio.wait_for(self._ws.send(raw), timeout=10)
-            except Exception as e:
-                logger.exception("WebSocket send failed: %s", e)
-                raise BridgeError(e)
-
-    async def recv(self) -> Optional[Dict[str, Any]]:
-        # pop from internal queue which _listener fills
-        try:
-            raw = await self._recv_queue.get()
-            return raw
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.exception("WebSocket recv error: %s", e)
-            raise BridgeError(e)
-
-    async def close(self) -> None:
-        self._closing = True
-        if self._pinger_task:
-            self._pinger_task.cancel()
-        if self._listener_task:
-            self._listener_task.cancel()
-        if self._ws is not None:
-            try:
-                await self._ws.close()
-            except Exception as e:
-                logger.debug("Error closing websocket: %s", e)
-        self._connected.clear()
-
-    async def _listener(self):
-        assert self._ws is not None
-        try:
-            async for raw in self._ws:
-                try:
-                    parsed = self.deserializer(raw)
-                except Exception:
-                    logger.exception("Failed to parse WS message")
-                    continue
-                # enqueue parsed message
-                await self._recv_queue.put(parsed)
-        except asyncio.CancelledError:
-            return
-        except Exception as e:
-            logger.exception("WebSocket listener crashed: %s", e)
-            # try to reconnect unless we're closing
-            if not self._closing:
-                self._connected.clear()
-                await self.connect()
-
-    async def _pinger(self):
-        while True:
-            try:
-                if self._ws and self._ws.open:
-                    try:
-                        await self._ws.ping()
-                    except Exception:
-                        logger.debug("Ping failed, connection may be unhealthy")
-                await asyncio.sleep(self.ping_interval)
-            except asyncio.CancelledError:
-                return
-            except Exception:
-                logger.exception("Pinger error")
-
-
-# ---------------------------
-# HTTP Bridge
-# ---------------------------
-try:
-    import aiohttp
-
-except Exception:
-    aiohttp = None
-
-
-class HttpBridge(BaseBridge):
-    """HTTP bridge that posts messages to `/message` and long-polls `/poll`.
-
-    NOTE: HTTP is less efficient than WebSocket but useful for environments
-    where WS is not available. This implementation opens a background task
-    that polls for messages and places them on an internal queue.
-    """
-
-    def __init__(
-        self,
-        base_url: str,
-        auth_token: Optional[str] = None,
-        poll_interval: float = 1.0,
-        session: Optional["aiohttp.ClientSession"] = None, # Yellow underline at aiohttp
-        loop: Optional[asyncio.AbstractEventLoop] = None,
-    ):
-        if aiohttp is None:
-            raise BridgeError("aiohttp not installed. `pip install aiohttp`")
-
-        self.base_url = base_url.rstrip("/")
-        self.auth_token = auth_token
-        self.poll_interval = poll_interval
-        self._external_session = session
-        self._session: Optional[aiohttp.ClientSession] = session # Yellow underline at aiohttp
-        self.loop = loop or asyncio.get_event_loop()
-
-        self._recv_queue: asyncio.Queue = asyncio.Queue()
-        self._poll_task: Optional[asyncio.Task] = None
-        self._closing = False
-
-    async def connect(self) -> None:
-        if self._session is None:
-            self._session = aiohttp.ClientSession()
-        # start poller
-        self._poll_task = self.loop.create_task(self._poll_loop())
-
-    async def send(self, msg: Dict[str, Any]) -> Any:
-        if self._session is None:
-            self._session = aiohttp.ClientSession()
-        url = f"{self.base_url}/message"
-        headers = {"Content-Type": "application/json"}
-        if self.auth_token:
-            headers["Authorization"] = f"Bearer {self.auth_token}"
-        raw = self.serializer(msg)
-        async with self._session.post(url, data=raw, headers=headers) as resp:
-            if resp.status >= 400:
-                text = await resp.text()
-                logger.error("HTTP send failed: %s %s", resp.status, text)
-                raise BridgeError(f"HTTP send failed: {resp.status}")
-            try:
-                body = await resp.json()
-            except Exception:
-                body = await resp.text()
-            return body
-
-    async def recv(self) -> Optional[Dict[str, Any]]:
-        try:
-            return await self._recv_queue.get()
-        except asyncio.CancelledError:
-            raise
-
-    async def close(self) -> None:
-        self._closing = True
-        if self._poll_task:
-            self._poll_task.cancel()
-        if self._session and self._session is not self._external_session:
-            await self._session.close()
-
-    async def _poll_loop(self):
-        assert self._session is not None
-        url = f"{self.base_url}/poll"
-        headers = {"Accept": "application/json"}
-        if self.auth_token:
-            headers["Authorization"] = f"Bearer {self.auth_token}"
-        while not self._closing:
-            try:
-                async with self._session.get(url, headers=headers) as resp:
-                    if resp.status == 204:
-                        # no content, sleep and continue
-                        await asyncio.sleep(self.poll_interval)
-                        continue
-                    if resp.status >= 400:
-                        text = await resp.text()
-                        logger.warning("Polling error %s: %s", resp.status, text)
-                        await asyncio.sleep(self.poll_interval)
-                        continue
-                    # expect JSON array of messages or single message
-                    try:
-                        body = await resp.json()
-                    except Exception:
-                        logger.exception("Failed to parse poll response")
-                        await asyncio.sleep(self.poll_interval)
-                        continue
-                    # normalize to list
-                    msgs = body if isinstance(body, list) else [body]
-                    for m in msgs:
-                        await self._recv_queue.put(m)
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                logger.exception("Poll loop exception: %s", e)
-                await asyncio.sleep(self.poll_interval)
-
-
-# ---------------------------
-# In-Memory Bridge (Testing)
-# ---------------------------
-class InMemoryBridge(BaseBridge):
-    """Simple in-process bridge for testing and demos.
-
-    Behavior:
-    - Maintains per-agent queues in a central registry
-    - Each endpoint should be created via `InMemoryEndpoint(bridge, agent_id)`
-    - Supports broadcast by leaving `to_agent` empty
-    """
-
-    def __init__(self):
-        self._queues: Dict[str, asyncio.Queue] = {}
-        self._lock = asyncio.Lock()
-
-    def _ensure(self, agent_id: str) -> asyncio.Queue:
-        q = self._queues.get(agent_id)
-        if q is None:
-            q = asyncio.Queue()
-            self._queues[agent_id] = q
-        return q
-
-
-class InMemoryEndpoint:
-    def __init__(self, bridge: InMemoryBridge, agent_id: str):
-        self.bridge = bridge
+        Args:
+            agent_id: The ID of the agent this bridge serves. Used for logging.
+            uri: The WebSocket URI of the Context Bus (e.g., "ws://localhost:8765").
+            on_message: An async function (coroutine) that will be called
+                        with each `LinkMessage` received from the server.
+            on_connect: An optional async function (coroutine) to be called
+                        upon a successful (re)connection.
+            max_retry_delay: The maximum delay (in seconds) between reconn attempts.
+            initial_retry_delay: The initial delay (in seconds) for reconn.
+        """
         self.agent_id = agent_id
-        self._q = bridge._ensure(agent_id)
+        self.uri = uri
+        self.on_message_callback = on_message
+        self.on_connect_callback = on_connect
+        
+        self.max_retry_delay = max_retry_delay
+        self.initial_retry_delay = initial_retry_delay
+        
+        self._websocket: Optional[WebSocketClientProtocol] = None
+        self._is_connected: bool = False
+        self._listen_task: Optional[asyncio.Task] = None
+        self._stop_event: asyncio.Event = asyncio.Event()
+
+    @property
+    def is_connected(self) -> bool:
+        """Returns True if the bridge is currently connected, False otherwise."""
+        return self._is_connected
 
     async def connect(self) -> None:
-        return
+        """
+        Creates and starts the persistent listening task.
 
-    async def send(self, msg: Dict[str, Any]) -> None:
-        to = msg.get("to_agent") or msg.get("to")
-        # broadcast
-        if not to:
-            for aid, q in self.bridge._queues.items():
-                await q.put(msg)
+        If the task is already running, this does nothing.
+        """
+        if self._listen_task and not self._listen_task.done():
+            logger.warning(f"[{self.agent_id}] Already connected or connecting.")
             return
-        # ensure recip queue
-        q = self.bridge._ensure(to)
-        await q.put(msg)
 
-    async def recv(self) -> Dict[str, Any]:
-        return await self._q.get()
+        self._stop_event.clear()
+        self._listen_task = asyncio.create_task(
+            self._connection_listener(),
+            name=f"llm-link-bridge-{self.agent_id}"
+        )
+        logger.info(f"[{self.agent_id}] Connection listener started.")
 
-    async def close(self) -> None:
-        return
+    async def disconnect(self) -> None:
+        """
+        Signals the connection listener to stop and closes the connection.
+        """
+        if not self._listen_task or self._stop_event.is_set():
+            logger.info(f"[{self.agent_id}] Already disconnected.")
+            return
 
+        logger.info(f"[{self.agent_id}] Disconnecting...")
+        self._stop_event.set()  # Signal the listener to stop
+        
+        if self._websocket and self._is_connected:
+            try:
+                await self._websocket.close(code=1000, reason="Client shutting down")
+            except WebSocketException as e:
+                logger.warning(f"[{self.agent_id}] Error during close: {e}")
 
-# ---------------------------
-# Utilities & Examples
-# ---------------------------
-async def health_check(bridge: BaseBridge, timeout: float = 2.0) -> bool:
-    """Quick health check: connect, optionally send a ping/heartbeat, and close."""
-    try:
-        await bridge.connect()
-        # try a noop send if supported (some transports may not allow it)
         try:
-            await bridge.send({"type": "heartbeat", "from": "health-check", "content": {"ts": time.time()}})
-        except Exception:
-            pass
-        await bridge.close()
-        return True
-    except Exception:
+            # Wait for the listener task to fully stop
+            await asyncio.wait_for(self._listen_task, timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning(f"[{self.agent_id}] Listener task did not stop gracefully.")
+            self._listen_task.cancel()
+            
+        self._listen_task = None
+        self._is_connected = False
+        logger.info(f"[{self.agent_id}] Disconnected.")
+
+    async def _connection_listener(self) -> None:
+        """
+        The main loop that handles connection, reception, and reconnection.
+        """
+        retry_delay = self.initial_retry_delay
+
+        while not self._stop_event.is_set():
+            try:
+                # --- 1. Attempt Connection ---
+                logger.info(f"[{self.agent_id}] Connecting to {self.uri}...")
+                async with websockets.connect(self.uri) as ws:
+                    self._websocket = ws
+                    self._is_connected = True
+                    logger.info(f"[{self.agent_id}] Connection established.")
+                    
+                    # Reset retry delay on successful connection
+                    retry_delay = self.initial_retry_delay
+
+                    # --- 2. Run Connection Hook ---
+                    if self.on_connect_callback:
+                        try:
+                            await self.on_connect_callback()
+                        except Exception as e:
+                            logger.error(f"[{self.agent_id}] Error in on_connect hook: {e}")
+
+                    # --- 3. Listen for Messages ---
+                    # This loop runs as long as the connection is open
+                    async for raw_message in self._websocket:
+                        if self._stop_event.is_set():
+                            break  # Exit if disconnect was called
+                        
+                        try:
+                            message = parse_message(raw_message)
+                            # Pass the valid message to the client's handler
+                            await self.on_message_callback(message)
+                            
+                        except (ValidationError, json.JSONDecodeError) as e:
+                            logger.error(f"[{self.agent_id}] Failed to parse message: {e}")
+                            logger.debug(f"[{self.agent_id}] Raw invalid message: {raw_message}")
+                        except Exception as e:
+                            logger.error(f"[{self.agent_id}] Error in on_message callback: {e}")
+
+            except (ConnectionClosed, WebSocketException, OSError) as e:
+                logger.warning(f"[{self.agent_id}] Connection lost: {type(e).__name__} {e}")
+            
+            except Exception as e:
+                logger.error(f"[{self.agent_id}] Unhandled bridge error: {e}", exc_info=True)
+                
+            finally:
+                # --- START: MODIFIED SECTION ---
+                # The finally block ONLY does cleanup. It does not control the loop.
+                self._is_connected = False
+                self._websocket = None
+                # --- END: MODIFIED SECTION ---
+            
+            # --- START: NEW SECTION ---
+            # The loop control and reconnection logic is now OUTSIDE the finally block.
+            if self._stop_event.is_set():
+                logger.info(f"[{self.agent_id}] Listener loop stopping as requested.")
+                break # This break is now valid.
+
+            # Reconnection Logic
+            logger.info(f"[{self.agent_id}] Reconnecting in {retry_delay}s...")
+            try:
+                # Wait for the retry delay, but check stop_event every second
+                for _ in range(retry_delay):
+                    if self._stop_event.is_set():
+                        break
+                    await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                logger.info(f"[{self.agent_id}] Reconnect wait cancelled.")
+                break # This break is also valid.
+            
+            # Exponential backoff
+            retry_delay = min(retry_delay * 2, self.max_retry_delay)
+            # --- END: NEW SECTION ---
+        
+        logger.info(f"[{self.agent_id}] Connection listener terminated.")
+
+
+    async def send(self, message: LinkMessage) -> bool:
+        """
+        Sends a LinkMessage over the WebSocket connection.
+
+        Args:
+            message: The `LinkMessage` object to send.
+
+        Returns:
+            True if the message was sent successfully, False otherwise.
+        """
+        if not self._is_connected or not self._websocket:
+            logger.error(f"[{self.agent_id}] Cannot send: Not connected.")
+            return False
+
+        try:
+            json_message = serialize_message(message)
+            await self._websocket.send(json_message)
+            return True
+        except ConnectionClosed as e:
+            logger.error(f"[{self.agent_id}] Failed to send: Connection closed. {e}")
+            self._is_connected = False # Trigger reconnect
+        except WebSocketException as e:
+            logger.error(f"[{self.agent_id}] Failed to send: WebSocket error. {e}")
+        except Exception as e:
+            logger.error(f"[{self.agent_id}] Failed to serialize or send: {e}")
+
         return False
-
-
-if __name__ == "__main__":
-    import asyncio
-    import logging
-
-    logging.basicConfig(level=logging.DEBUG)
-
-    async def demo():
-        # WS demo (requires an echo/ws server)
-        # ws = WebSocketClientBridge('ws://localhost:8765')
-        # await ws.connect()
-        # await ws.send({'from': 'a', 'to': 'b', 'content': 'hi'})
-        # print(await ws.recv())
-
-        # HTTP demo (requires a compatible HTTP server)
-        # http = HttpBridge('http://localhost:8080')
-        # await http.connect()
-        # await http.send({'from': 'a', 'to': 'b', 'content': 'hi'})
-        # print(await http.recv())
-
-        # In-memory demo
-        bridge = InMemoryBridge()
-        a = InMemoryEndpoint(bridge, 'agent.a')
-        b = InMemoryEndpoint(bridge, 'agent.b')
-        await a.connect()
-        await b.connect()
-
-        await a.send({'from': 'agent.a', 'to': 'agent.b', 'intent': 'hello', 'content': 'hey'})
-        msg = await b.recv()
-        print('B got:', msg)
-
-    asyncio.run(demo())
