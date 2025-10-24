@@ -17,14 +17,13 @@
 # - Requires `websockets` for WebSocket transport and `aiohttp` for HTTP transport.
 # - This file focuses on correctness and clarity over extreme micro-optimizations.
 # ------------------------------------------------------------
-from websockets import WebSocketClientProtocol
 from __future__ import annotations
 import asyncio
 import json
 import logging
 import time
 from typing import Any, Callable, Dict, Optional, Awaitable
-
+from websockets import WebSocketClientProtocol
 logger = logging.getLogger("link_llm.bridge")
 
 

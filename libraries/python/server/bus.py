@@ -24,6 +24,7 @@
 #   await bus.handle_incoming(payload_dict)
 #
 # ------------------------------------------------------------
+
 from .protocol import LinkMessage
 from __future__ import annotations
 import asyncio
