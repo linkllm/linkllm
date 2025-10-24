@@ -1,418 +1,355 @@
-# client.py — LinkLLM Client (Production-Ready)
-# ------------------------------------------------------------
-# Async-first client that connects an agent to a Bridge (WebSocket/HTTP/InMemory)
-# Implements: reliable send, receive loop, handler routing, middleware, reconnect,
-#            batching, backpressure, metrics, tracing integration hooks, and sync wrappers.
-# ------------------------------------------------------------
-from __future__ import annotations
-from .protocol import LinkMessage, MessageType, Role, LinkHeader
+"""
+link_llm.client
+~~~~~~~~~~~~~~~
+
+This module implements the high-level `LinkClient`, which acts as the
+primary interface for an AI agent to interact with the LLM-Link Context Bus.
+
+It utilizes the `WebsocketBridge` for reliable transport and provides
+developer-friendly methods for:
+1. Connecting and automatically registering the agent.
+2. Handling incoming protocol messages (tasks, context queries, etc.)
+   using a decorator-based routing system.
+3. Sending outbound protocol messages (task requests, memory updates).
+"""
+
 import asyncio
 import logging
-import time
-from typing import Any, Awaitable, Callable, Dict, Optional, List
-from dataclasses import dataclass, field
+from typing import Callable, Any, Dict, List, Optional, Type, Coroutine
 
-# The real package would import these from .protocol and .bridge
-try:
-    LinkMessage  # type: ignore
-    MessageType
-    Role
-except NameError:
-    # If this file is used standalone in the canvas, rely on the earlier definitions
-    pass
+from pydantic import ValidationError
 
-logger = logging.getLogger("link_llm.client")
+from .bridge import WebsocketBridge, MessageCallback
+from .protocol import (
+    PROTOCOL_VERSION, 
+    LinkMessage,
+    MessageType,
+    TaskRequestPayload,
+    TaskResponsePayload,
+    ContextSharePayload,
+    MemoryUpdatePayload,
+    MemoryQueryPayload,
+    MemoryResponsePayload,
+    AgentRegisterPayload,
+    ErrorPayload,
+    BasePayload,
+    TaskStatus,
+    MemoryPersistence,
+    BROADCAST_ID,
+    create_message,
+    parse_payload
+)
 
-# -----------------------------
-# Types
-# -----------------------------
-MessageHandler = Callable[["LinkMessage"], Awaitable[None]]
-SyncMessageHandler = Callable[["LinkMessage"], None]
-MiddlewareFn = Callable[["LinkMessage", Callable[["LinkMessage"], Awaitable[None]]], Awaitable[None]]
+logger = logging.getLogger(__name__)
 
-
-@dataclass
-class ClientConfig:
-    agent_id: str
-    bridge: Any
-    heartbeat_interval: Optional[float] = 20.0
-    reconnect_backoff: float = 1.0
-    max_reconnect_backoff: float = 30.0
-    recv_concurrency: int = 4
-    send_timeout: float = 30.0
-    metrics_enabled: bool = True
-    safe_mode: bool = False  # disable executing untrusted handlers
-    loop: Optional[asyncio.AbstractEventLoop] = None
+# Type for Task Handler: A coroutine that accepts a payload and returns a result
+TaskHandler = Callable[[BasePayload], Coroutine[None, None, Optional[Dict[str, Any]]]]
 
 
-# -----------------------------
-# Metrics & instrumentation
-# -----------------------------
-@dataclass
-class Metrics:
-    sent: int = 0
-    received: int = 0
-    send_errors: int = 0
-    recv_errors: int = 0
-    last_error: Optional[str] = None
-    last_sent_at: Optional[float] = None
-    last_recv_at: Optional[float] = None
-
-
-# -----------------------------
-# Client Implementation
-# -----------------------------
-class Client:
-    """High-level client to connect an agent to a message Bus via a Bridge.
-
-    Features:
-    - Async receive loop with configurable concurrency
-    - Handler registration by message type or intent
-    - Middleware pipeline
-    - Automatic reconnect for bridges that support it
-    - Heartbeat pings
-    - Backpressure-safe sending with optional rate-limiting
-    - Simple tracing hooks
+class LinkClient:
     """
+    The main client for an LLM-Link agent.
 
-    def __init__(self, config: ClientConfig):
-        self.agent_id = config.agent_id
-        self.bridge = config.bridge
-        self.heartbeat_interval = config.heartbeat_interval
-        self.reconnect_backoff = config.reconnect_backoff
-        self.max_reconnect_backoff = config.max_reconnect_backoff
-        self.recv_concurrency = config.recv_concurrency
-        self.send_timeout = config.send_timeout
-        self.loop = config.loop or asyncio.get_event_loop()
-
-        self._running = False
-        self._recv_tasks: List[asyncio.Task] = []
-        self._handlers: Dict[str, MessageHandler] = {}
-        self._intent_handlers: Dict[str, MessageHandler] = {}
-        self._middleware: List[MiddlewareFn] = []
-        self._metrics = Metrics()
-
-        # Internal queues
-        self._send_lock = asyncio.Lock()
-        self._send_queue: asyncio.Queue = asyncio.Queue()
-
-        # Reconnect state
-        self._reconnect_attempts = 0
-
-        # graceful shutdown
-        self._stop_event = asyncio.Event()
-
-    # -----------------------------
-    # Public API
-    # -----------------------------
-    async def start(self):
-        """Connect the underlying bridge and start receive and send background tasks."""
-        logger.info("Client starting: %s", self.agent_id)
-        self._running = True
-        await self._maybe_connect_bridge()
-        # start background loops
-        # send pump
-        self._send_task = self.loop.create_task(self._send_pump())
-        # recv workers
-        for _ in range(max(1, self.recv_concurrency)):
-            t = self.loop.create_task(self._recv_worker())
-            self._recv_tasks.append(t)
-        # heartbeat
-        if self.heartbeat_interval:
-            self._hb_task = self.loop.create_task(self._heartbeat_loop())
-
-    async def stop(self):
-        """Stop loops and close bridge."""
-        logger.info("Client stopping: %s", self.agent_id)
-        self._running = False
-        self._stop_event.set()
-        # cancel recv tasks
-        for t in self._recv_tasks:
-            t.cancel()
-        # cancel send task
-        try:
-            self._send_task.cancel()
-        except Exception:
-            pass
-        try:
-            self._hb_task.cancel()
-        except Exception:
-            pass
-        # close bridge
-        close = getattr(self.bridge, "close", None)
-        if asyncio.iscoroutinefunction(close):
-            try:
-                await close()
-            except Exception as e:
-                logger.debug("Bridge close error: %s", e)
-
-    async def send(self, to: Optional[str], intent: str, content: Any = None, type: Any = None, context: Optional[list] = None, memory_refs: Optional[list] = None, meta: Optional[dict] = None, timeout: Optional[float] = None) -> "LinkMessage":
-        """Compose and enqueue a message for sending.
-
-        Returns the LinkMessage object that was enqueued (not necessarily delivered).
+    Provides a simple, async interface for multi-agent communication.
+    """
+    
+    def __init__(self, agent_id: str, capabilities: List[str] = None):
         """
-        if type is None:
-            type = MessageType.TASK
-        msg = LinkMessage(header=None, from_agent=self.agent_id, to_agent=to, type=type, role=Role.AGENT, intent=intent, content=content, context=context or [], memory_refs=memory_refs or [], meta=meta or {})
-        # attach header if missing
-        if getattr(msg, "header", None) is None:
-            from .protocol import LinkHeader
-            msg.header = LinkHeader()
-        # put into send queue
-        await self._send_queue.put(msg)
-        return msg
+        Initializes the LinkClient.
 
-    def on_type(self, mtype: Any, handler: MessageHandler):
-        """Register a handler for a message type (MessageType)."""
-        key = mtype.value if isinstance(mtype, MessageType) else str(mtype)
-        self._handlers[key] = handler
-
-    def on_intent(self, intent: str, handler: MessageHandler):
-        """Register a handler for a semantic intent string."""
-        self._intent_handlers[intent] = handler
-
-    def add_middleware(self, mw: MiddlewareFn):
-        """Add a middleware to the inbound dispatch pipeline.
-
-        Middleware signature: async def mw(msg, next): await next(msg)
+        Args:
+            agent_id: A unique identifier for this agent instance.
+            capabilities: A list of tasks this agent is capable of handling
+                          (e.g., ["summarize", "research_query"]).
         """
-        self._middleware.append(mw)
+        if not agent_id:
+            raise ValueError("agent_id cannot be empty.")
+            
+        self.agent_id: str = agent_id
+        self.capabilities: List[str] = capabilities or []
+        self._handlers: Dict[MessageType, TaskHandler] = {}
+        self._task_handlers: Dict[str, TaskHandler] = {}
+        self._response_futures: Dict[str, asyncio.Future] = {}
+        self._bridge: Optional[WebsocketBridge] = None
 
-    # -----------------------------
-    # Internal loops
-    # -----------------------------
-    async def _maybe_connect_bridge(self):
-        connect = getattr(self.bridge, "connect", None)
-        if asyncio.iscoroutinefunction(connect):
-            backoff = self.reconnect_backoff
-            while True:
+    @property
+    def is_connected(self) -> bool:
+        """Checks if the client is currently connected to the Context Bus."""
+        return self._bridge.is_connected if self._bridge else False
+
+    # --- Connection Management ---
+
+    async def connect(self, uri: str = "ws://localhost:8765") -> None:
+        """
+        Connects the client to the LLM-Link Context Bus.
+
+        Args:
+            uri: The WebSocket URI of the Context Bus.
+        """
+        logger.info(f"[{self.agent_id}] Initializing connection to {uri}")
+        
+        # Initialize the bridge, passing our message_router as the callback
+        self._bridge = WebsocketBridge(
+            agent_id=self.agent_id,
+            uri=uri,
+            on_message=self._message_router,
+            on_connect=self._on_connect_hook
+        )
+        await self._bridge.connect()
+
+    async def disconnect(self) -> None:
+        """Closes the connection to the Context Bus."""
+        if self._bridge:
+            await self._bridge.disconnect()
+            
+    async def _on_connect_hook(self) -> None:
+        """Called by the bridge upon successful connection/reconnection."""
+        logger.info(f"[{self.agent_id}] Connection hook triggered. Registering agent.")
+        await self.register_agent()
+
+    # --- Handler Registration (Developer API) ---
+
+    def on_message(self, message_type: MessageType) -> Callable[[TaskHandler], TaskHandler]:
+        """
+        Decorator to register a handler function for a specific LinkMessage type.
+        
+        Example:
+            @client.on_message(MessageType.CONTEXT_QUERY)
+            async def handle_query(payload: ContextQueryPayload):
+                ...
+        """
+        def decorator(func: TaskHandler) -> TaskHandler:
+            self._handlers[message_type] = func
+            logger.debug(f"[{self.agent_id}] Registered general handler for {message_type.value}")
+            return func
+        return decorator
+
+    def on_task(self, task_name: str) -> Callable[[TaskHandler], TaskHandler]:
+        """
+        Decorator to register a handler function for a specific TaskRequest name.
+        
+        Example:
+            @client.on_task("summarize_document")
+            async def handle_summary(payload: TaskRequestPayload):
+                ...
+        """
+        def decorator(func: TaskHandler) -> TaskHandler:
+            self._task_handlers[task_name] = func
+            logger.debug(f"[{self.agent_id}] Registered task handler for '{task_name}'")
+            return func
+        return decorator
+
+    # --- Outbound Messaging (Client API) ---
+
+    async def register_agent(self) -> bool:
+        """Sends the AGENT_REGISTER message to the Context Bus."""
+        payload = AgentRegisterPayload(
+            agent_id=self.agent_id,
+            capabilities=list(self._task_handlers.keys()),
+            metadata={"sdk_version": PROTOCOL_VERSION}  #yellow underline "PROTOCOL_VERSION" is not defined
+        )
+        message = create_message(
+            sender_id=self.agent_id,
+            message_type=MessageType.AGENT_REGISTER,
+            payload=payload,
+            receiver_id=BROADCAST_ID # Typically sent to the Bus
+        )
+        return await self._send(message)
+
+    async def request_task(
+        self,
+        receiver_id: str,
+        task_name: str,
+        content: Any,
+        context: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None
+    ) -> TaskResponsePayload:
+        """
+        Requests another agent to perform a specific task.
+        
+        Args:
+            receiver_id: The ID of the agent to send the request to.
+            task_name: The name of the task (must match a capability).
+            content: The primary data/content for the task.
+            context: Additional supporting context.
+            timeout: If set, waits for the response for this duration.
+
+        Returns:
+            The TaskResponsePayload from the receiving agent.
+            
+        Raises:
+            asyncio.TimeoutError: If the response is not received in time.
+        """
+        payload = TaskRequestPayload(
+            task_name=task_name,
+            content=content,
+            context=context or {}
+        )
+        
+        request_message = create_message(
+            sender_id=self.agent_id,
+            receiver_id=receiver_id,
+            message_type=MessageType.TASK_REQUEST,
+            payload=payload
+        )
+        
+        # Create a Future to wait for the corresponding TASK_RESPONSE
+        response_future = asyncio.get_event_loop().create_future()
+        self._response_futures[request_message.message_id] = response_future
+        
+        await self._send(request_message)
+
+        try:
+            response_payload: TaskResponsePayload = await asyncio.wait_for(
+                response_future, timeout=timeout
+            )
+            return response_payload
+        finally:
+            # Clean up the future whether it succeeded or timed out
+            self._response_futures.pop(request_message.message_id, None)
+
+    async def share_context(self, receiver_id: str, data: Dict[str, Any]) -> bool:
+        """Sends a piece of contextual state to another agent."""
+        payload = ContextSharePayload(data=data)
+        message = create_message(
+            sender_id=self.agent_id,
+            receiver_id=receiver_id,
+            message_type=MessageType.CONTEXT_SHARE,
+            payload=payload
+        )
+        return await self._send(message)
+
+    async def update_memory(self, key: str, data: Any, persistence: MemoryPersistence = MemoryPersistence.ETERNAL) -> bool:
+        """Requests the Memory Registry (via the Bus) to store information."""
+        payload = MemoryUpdatePayload(
+            key=key,
+            data=data,
+            persistence=persistence
+        )
+        message = create_message(
+            sender_id=self.agent_id,
+            receiver_id=BROADCAST_ID, # Typically handled by the Bus/Registry
+            message_type=MessageType.MEMORY_UPDATE,
+            payload=payload
+        )
+        return await self._send(message)
+    
+    # --- Internal Message Processing ---
+
+    async def _send(self, message: LinkMessage) -> bool:
+        """Internal helper to serialize and send a message via the bridge."""
+        if not self.is_connected:
+            logger.warning(f"[{self.agent_id}] Tried to send message but not connected.")
+            return False
+            
+        logger.debug(f"[{self.agent_id}] Sending {message.message_type.value} to {message.receiver_id}")
+        return await self._bridge.send(message)
+
+    async def _message_router(self, message: LinkMessage) -> None:
+        """
+        The central handler for all incoming messages from the Context Bus.
+        Passed directly to the WebsocketBridge.
+        """
+        
+        # 1. Handle Response Futures (Correlate task responses with requests)
+        if message.correlation_id in self._response_futures:
+            future = self._response_futures.get(message.correlation_id)
+            if future and not future.done():
                 try:
-                    await connect()
-                    logger.info("Bridge connected")
-                    self._reconnect_attempts = 0
-                    return
-                except Exception as e:
-                    self._reconnect_attempts += 1
-                    logger.warning("Bridge connect failed (%s). retry in %ss", e, backoff)
-                    await asyncio.sleep(backoff)
-                    backoff = min(self.max_reconnect_backoff, backoff * 2)
-        else:
-            # no connect method - assume bridge is usable
+                    # Expecting a TaskResponsePayload or similar for correlation
+                    payload = parse_payload(message, TaskResponsePayload)
+                    future.set_result(payload)
+                except (ValidationError, KeyError) as e:
+                    logger.error(f"[{self.agent_id}] Correlated message {message.correlation_id} had invalid payload: {e}")
+                    future.set_exception(e)
             return
-
-    async def _send_pump(self):
-        """Take messages from _send_queue and push them to the bridge.
-        Includes retries and safe ordering.
-        """
-        while self._running:
-            try:
-                msg: LinkMessage = await self._send_queue.get()
-                # optional middleware for outbound can go here
-                await self._send_with_retry(msg)
-                self._metrics.sent += 1
-                self._metrics.last_sent_at = time.time()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                self._metrics.send_errors += 1
-                self._metrics.last_error = str(e)
-                logger.exception("Error while sending message: %s", e)
-                await asyncio.sleep(0.5)
-
-    async def _send_with_retry(self, msg: LinkMessage):
-        # simple retry with exponential backoff
-        attempt = 0
-        backoff = 0.2
-        while True:
-            try:
-                # ensure bridge has send
-                await asyncio.wait_for(self.bridge.send(msg.to_dict()), timeout=self.send_timeout)
-                return
-            except Exception as e:
-                attempt += 1
-                self._metrics.send_errors += 1
-                logger.warning("Send attempt %s failed: %s", attempt, e)
-                await asyncio.sleep(backoff)
-                backoff = min(5.0, backoff * 2)
-
-    async def _recv_worker(self):
-        """Continuously receive from the bridge and dispatch to handlers."""
-        while self._running:
-            try:
-                raw = await self.bridge.recv()
-                if raw is None:
-                    # bridge signalled no data or closed
-                    await asyncio.sleep(0.01)
-                    continue
-                # parse message
-                if isinstance(raw, str):
-                    msg = LinkMessage.from_json(raw)
-                else:
-                    msg = LinkMessage.from_dict(raw)
-                self._metrics.received += 1
-                self._metrics.last_recv_at = time.time()
-                # dispatch with middleware
-                await self._dispatch_with_middleware(msg)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                self._metrics.recv_errors += 1
-                self._metrics.last_error = str(e)
-                logger.exception("Receive error: %s", e)
-                # Attempt reconnect behavior if bridge supports it
-                await asyncio.sleep(min(1 + self._reconnect_attempts, self.max_reconnect_backoff))
-                try:
-                    await self._maybe_connect_bridge()
-                except Exception:
-                    self._reconnect_attempts += 1
-
-    async def _dispatch_with_middleware(self, msg: LinkMessage):
-        """Apply middleware chain then dispatch to the matched handler."""
-        idx = 0
-
-        async def run_next(m: LinkMessage):
-            nonlocal idx
-            if idx < len(self._middleware):
-                fn = self._middleware[idx]
-                idx += 1
-                await fn(m, run_next)
-            else:
-                await self._dispatch(m)
-
-        await run_next(msg)
-
-    async def _dispatch(self, msg: LinkMessage):
-        # intent handler takes precedence
-        handler = None
-        if msg.intent and msg.intent in self._intent_handlers:
-            handler = self._intent_handlers[msg.intent]
-        elif msg.type and msg.type.value in self._handlers:
-            handler = self._handlers[msg.type.value]
-        elif msg.type:
-            # fallback to generic handlers by type
-            handler = self._handlers.get(str(msg.type.value))
-
+            
+        # 2. Handle Task Requests (Primary agent work)
+        if message.message_type == MessageType.TASK_REQUEST:
+            await self._handle_task_request(message)
+            return
+            
+        # 3. Handle General Message Types (Registered by user via @on_message)
+        handler = self._handlers.get(message.message_type)
         if handler:
+            # Determine the expected payload type for dynamic parsing
+            payload_map: Dict[MessageType, Type[BasePayload]] = {
+                MessageType.TASK_RESPONSE: TaskResponsePayload,
+                MessageType.CONTEXT_SHARE: ContextSharePayload,
+                MessageType.MEMORY_RESPONSE: MemoryResponsePayload,
+                MessageType.ERROR: ErrorPayload,
+                # AGENT_REGISTER is usually outbound, but useful for discovery
+                MessageType.AGENT_REGISTER: AgentRegisterPayload
+            }
+            
+            payload_type = payload_map.get(message.message_type, BasePayload)
+            
             try:
-                await handler(msg)
-            except Exception:
-                logger.exception("Handler raised exception")
-        else:
-            logger.debug("No handler for message %s (intent=%s type=%s)", msg.header.id if msg.header else '<noid>', msg.intent, msg.type)
-
-    async def _heartbeat_loop(self):
-        while self._running:
-            try:
-                hb = LinkMessage(from_agent=self.agent_id, to_agent=None, type=MessageType.HEARTBEAT, role=Role.AGENT, intent="heartbeat", content={"ts": time.time()})
-                if getattr(hb, "header", None) is None:
-                    from .protocol import LinkHeader
-                    hb.header = LinkHeader()
-                await self._send_queue.put(hb)
+                # Parse payload and call the general handler
+                payload = parse_payload(message, payload_type)
+                await handler(payload)
+            except ValidationError as e:
+                logger.error(f"[{self.agent_id}] Failed to validate payload for {message.message_type}: {e}")
             except Exception as e:
-                logger.debug("Heartbeat error: %s", e)
-            await asyncio.sleep(self.heartbeat_interval)
+                logger.error(f"[{self.agent_id}] Unhandled error in {message.message_type} handler: {e}")
+        else:
+            logger.warning(f"[{self.agent_id}] No handler registered for incoming message type: {message.message_type.value}")
 
-    # -----------------------------
-    # Utilities
-    # -----------------------------
-    def get_metrics(self) -> Metrics:
-        return self._metrics
+    async def _handle_task_request(self, message: LinkMessage) -> None:
+        """Processes an incoming TASK_REQUEST, executes the handler, and sends a response."""
+        task_response = None
+        
+        try:
+            # 1. Parse the Task Request
+            request_payload = parse_payload(message, TaskRequestPayload)
+            task_name = request_payload.task_name
+            
+            handler = self._task_handlers.get(task_name)
+            if not handler:
+                raise NotImplementedError(f"Task handler not registered for '{task_name}'")
+                
+            # 2. Execute the Task Handler (Sends status PENDING first if possible)
+            logger.info(f"[{self.agent_id}] Executing task: {task_name} (ID: {request_payload.task_id})")
 
-    # Synchronous wrappers for convenience
-    def start_sync(self):
-        asyncio.run(self.start())
+            # A simple synchronous way to send PENDING status is challenging in this setup
+            # We'll just execute and send the final SUCCESS/FAILURE
+            
+            result = await handler(request_payload) # Execute the user's task logic
+            
+            # 3. Create Success Response
+            task_response = TaskResponsePayload(
+                task_id=request_payload.task_id,
+                status=TaskStatus.SUCCESS,
+                result=result
+            )
 
-    def stop_sync(self):
-        asyncio.run(self.stop())
+        except NotImplementedError as e:
+            logger.warning(f"[{self.agent_id}] Task not implemented: {e}")
+            task_response = TaskResponsePayload(
+                task_id=request_payload.task_id if 'request_payload' in locals() else 'unknown',
+                status=TaskStatus.FAILURE,
+                error_message=f"Task not implemented by this agent: {e}"
+            )
+        except Exception as e:
+            logger.error(f"[{self.agent_id}] Error while processing task: {e}", exc_info=True)
+            # 4. Create Failure Response
+            task_response = TaskResponsePayload(
+                task_id=request_payload.task_id if 'request_payload' in locals() else 'unknown',
+                status=TaskStatus.FAILURE,
+                error_message=f"Internal agent error: {e}"
+            )
+        finally:
+            if task_response:
+                response_message = create_message(
+                    sender_id=self.agent_id,
+                    receiver_id=message.sender_id, # Send back to the original sender
+                    message_type=MessageType.TASK_RESPONSE,
+                    payload=task_response,
+                    correlation_id=message.message_id # Correlate with original request
+                )
+                await self._send(response_message)
+            
+# Update __init__.py with the new components
+# The user will do this implicitly when we give them the code for the next step.
 
-
-# -----------------------------
-# Example usage (local in-memory demo)
-# -----------------------------
-if __name__ == "__main__":
-    import logging
-
-    logging.basicConfig(level=logging.DEBUG)
-
-    # Minimal in-memory bridge implementation
-    class SimpleInMemoryBridge:
-        def __init__(self):
-            self.queues: Dict[str, asyncio.Queue] = {}
-
-        async def connect(self):
-            return
-
-        async def send(self, payload: Dict[str, Any]):
-            to = payload.get("to_agent") or payload.get("to")
-            # broadcast
-            if not to:
-                for q in self.queues.values():
-                    await q.put(payload)
-                return
-            if to not in self.queues:
-                self.queues[to] = asyncio.Queue()
-            await self.queues[to].put(payload)
-
-        async def recv_for(self, agent_id: str):
-            if agent_id not in self.queues:
-                self.queues[agent_id] = asyncio.Queue()
-            return await self.queues[agent_id].get()
-
-        # adapter for client.recv loop
-        async def recv(self):
-            raise NotImplementedError("Use per-agent endpoint wrapper")
-
-        async def close(self):
-            return
-
-    class LocalEndpoint:
-        def __init__(self, bridge: SimpleInMemoryBridge, agent_id: str):
-            self.bridge = bridge
-            self.agent_id = agent_id
-            if agent_id not in bridge.queues:
-                bridge.queues[agent_id] = asyncio.Queue()
-            self._q = bridge.queues[agent_id]
-
-        async def send(self, payload: Dict[str, Any]):
-            await self.bridge.send(payload)
-
-        async def recv(self) -> Dict[str, Any]:
-            return await self._q.get()
-
-        async def connect(self):
-            return
-
-        async def close(self):
-            return
-
-    async def demo():
-        bridge = SimpleInMemoryBridge()
-        a_endpoint = LocalEndpoint(bridge, "agent.alpha")
-        b_endpoint = LocalEndpoint(bridge, "agent.beta")
-
-        cfg_a = ClientConfig(agent_id="agent.alpha", bridge=a_endpoint)
-        cfg_b = ClientConfig(agent_id="agent.beta", bridge=b_endpoint)
-
-        client_a = Client(cfg_a)
-        client_b = Client(cfg_b)
-
-        async def handler_b(msg):
-            print("[B received]", msg.summarize())
-            await client_b.send(to=msg.from_agent, intent="result.summary", content={"reply": "I read that"}, type=MessageType.RESULT)
-
-        async def handler_a_result(msg):
-            print("[A got result]", msg.content)
-
-        client_b.on_type(MessageType.TASK, handler_b)
-        client_a.on_intent("result.summary", handler_a_result)
-
-        await client_a.start()
-        await client_b.start()
-
-        await client_a.send(to="agent.beta", intent="analyze.paper", content="Please summarize this paper")
-        await asyncio.sleep(1)
-
-        await client_a.stop()
-        await client_b.stop()
-
-    asyncio.run(demo())
+__all__ = ["LinkClient"]
