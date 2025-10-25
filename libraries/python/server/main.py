@@ -1,26 +1,16 @@
-# linkllm/libraries/python/server/main.py
+# main.py — Runs the LinkLLM Context Bus
 import asyncio
-import websockets
-import json
+import logging
+from link_llm.protocol import *
 from .registry import MemoryRegistry
+from .bus import ContextBus
 
-clients = set()
-registry = MemoryRegistry()
-
-async def handler(websocket):
-    clients.add(websocket)
-    try:
-        async for message in websocket:
-            for c in clients:
-                if c is not websocket:
-                    await c.send(message)
-    finally:
-        clients.remove(websocket)
+logging.basicConfig(level=logging.INFO)
 
 async def main():
-    async with websockets.serve(handler, "localhost", 8765):
-        print("Bus running on ws://localhost:8765")
-        await asyncio.Future()  # keep running
+    registry = MemoryRegistry()
+    bus = ContextBus(host="localhost", port=8765, registry=registry)
+    await bus.start()  # starts the websocket server and keeps it running
 
 if __name__ == "__main__":
     asyncio.run(main())
