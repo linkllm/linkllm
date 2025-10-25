@@ -146,7 +146,8 @@ class LinkClient:
         payload = AgentRegisterPayload(
             agent_id=self.agent_id,
             capabilities=list(self._task_handlers.keys()),
-            metadata={"sdk_version": PROTOCOL_VERSION}  #yellow underline "PROTOCOL_VERSION" is not defined
+            metadata={"sdk_version": PROTOCOL_VERSION},
+            protocol_version=PROTOCOL_VERSION  # <- new, explicit
         )
         message = create_message(
             sender_id=self.agent_id,
@@ -155,6 +156,7 @@ class LinkClient:
             receiver_id=BROADCAST_ID # Typically sent to the Bus
         )
         return await self._send(message)
+
 
     async def request_task(
         self,

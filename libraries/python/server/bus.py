@@ -333,10 +333,11 @@ class ContextBus:
 
     async def _send_error(self, websocket: WebSocketServerProtocol, error_message: str, correlation_id: Optional[str] = None):
         """Sends a standardized ERROR message over a raw websocket."""
-        error_payload = ErrorPayload(error_message=error_message)
+        error_payload = ErrorPayload(message=error_message)
+        # If receiver isn't known yet, use BROADCAST_ID in the envelope (bus-level)
         error_msg = create_message(
             sender_id="ContextBus",
-            receiver_id=None, # Receiver is unknown or not yet registered
+            receiver_id=BROADCAST_ID,
             message_type=MessageType.ERROR,
             payload=error_payload,
             correlation_id=correlation_id
@@ -345,7 +346,7 @@ class ContextBus:
 
     async def _send_error_to_agent(self, agent_id: str, error_message: str, correlation_id: Optional[str] = None):
         """Sends a standardized ERROR message to a registered agent by ID."""
-        error_payload = ErrorPayload(error_message=error_message)
+        error_payload = ErrorPayload(message=error_message)
         error_msg = create_message(
             sender_id="ContextBus",
             receiver_id=agent_id,
@@ -354,6 +355,7 @@ class ContextBus:
             correlation_id=correlation_id
         )
         await self._send_to_agent(agent_id, error_msg)
+
 
     async def _send_message_to_socket(self, websocket: WebSocketServerProtocol, message: LinkMessage):
         """Safely serializes and sends a LinkMessage over a websocket."""
