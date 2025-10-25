@@ -108,6 +108,10 @@ class AgentRegisterPayload(BasePayload):
         default_factory=dict,
         description="Optional metadata about the agent (e.g., model, version)."
     )
+    protocol_version: str = Field(
+        default=PROTOCOL_VERSION,
+        description="The protocol version the agent speaks."
+    )
 
 class TaskRequestPayload(BasePayload):
     """
@@ -184,6 +188,11 @@ class MemoryUpdatePayload(BasePayload):
         default=MemoryPersistence.SESSION,
         description="The desired persistence level (session or eternal)."
     )
+    # Optional owner id to tag session memory (set by server or agent)
+    owner_id: Optional[str] = Field(
+        default=None,
+        description="Optional owner / agent id for session-scoped memory."
+    )
 
 class MemoryQueryPayload(BasePayload):
     """
@@ -209,12 +218,16 @@ class ErrorPayload(BasePayload):
     Payload for ERROR.
     Sent when a message could not be processed or an error occurred.
     """
-    code: str = Field(..., description="An internal error code (e.g., '404_NOT_FOUND').")
+    code: Optional[str] = Field(default=None, description="An internal error code (e.g., '404_NOT_FOUND').")
     message: str = Field(..., description="A human-readable error message.")
     details: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Optional dictionary with more error details."
     )
+    # Add convenience alias for older code that used 'error_message' keyword
+    class Config:
+        allow_population_by_field_name = True
+        fields = {"message": {"alias": "error_message"}}
 
 # --- Main Protocol Message (Envelope) ---
 
