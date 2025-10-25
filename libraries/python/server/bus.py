@@ -1,241 +1,372 @@
 """
-link_llm.bridge
-~~~~~~~~~~~~~~~
+link_llm.server.bus
+~~~~~~~~~~~~~~~~~~~
 
-This module implements the low-level communication bridge.
-It handles the raw WebSocket connection, JSON serialization/deserialization,
-and automatic reconnection logic.
-
-The bridge is designed to be a reliable transport layer that the
-high-level `LinkClient` can use without worrying about connection
-drops or network errors.
+This module implements the `ContextBus`, the central WebSocket server that
+acts as the message broker and state manager for the LLM-Link network.
 """
 
 import asyncio
 import logging
-from typing import Callable, Coroutine, Optional
+from typing import Dict, Optional
 
-# We use the 'websockets' library for client connections.
-# The try/except block ensures a helpful message if the dependency is missing.
+# Use 'websockets' for the server implementation
 try:
     import websockets
-    from websockets.client import WebSocketClientProtocol
-    from websockets.exceptions import ConnectionClosed, WebSocketException
+    from websockets.server import WebSocketServerProtocol
+    from websockets.exceptions import ConnectionClosed
 except ImportError:
     print("Websockets library not installed. Please run 'pip install websockets'")
     raise
 
-# Import protocol utilities and types
+from pydantic import ValidationError
+
+# Import all necessary protocol components
 from link_llm.protocol import (
     LinkMessage,
+    MessageType,
+    AgentRegisterPayload,
+    MemoryQueryPayload,
+    MemoryUpdatePayload,
+    ErrorPayload,
+    TaskStatus,
+    TaskResponsePayload,
+    MemoryPersistence,
+    BROADCAST_ID,
+    PROTOCOL_VERSION,
     parse_message,
     serialize_message,
-    ValidationError
+    create_message,
+    parse_payload
 )
+# Import the MemoryRegistry from its sibling file
+from .registry import MemoryRegistry
 
-# Set up a logger for this module
 logger = logging.getLogger(__name__)
 
-# Type hint for the message handling callback
-# The handler must be a coroutine that accepts a LinkMessage
-MessageCallback = Callable[[LinkMessage], Coroutine[None, None, None]]
+# Type hint for the client registry
+ClientRegistry = Dict[str, WebSocketServerProtocol]
 
 
-class WebsocketBridge:
+class ContextBus:
     """
-    Manages the WebSocket connection to the LLM-Link Context Bus.
-
-    This class provides:
-    - Connection and disconnection logic.
-    - Automatic reconnection with exponential backoff.
-    - A `send` method to send `LinkMessage` objects.
-    - A mechanism to listen for incoming messages and pass them to a handler.
+    The main Context Bus server.
+    Manages all agent connections, message routing, and memory interfacing.
     """
 
-    # --- Configuration Constants ---
-    initial_retry_delay = 1.0  # seconds
-    max_retry_delay = 30.0  # seconds
-
-    def __init__(self, uri: str, agent_id: str):
-        """
-        Initializes the bridge.
-
-        Args:
-            uri: The WebSocket URI of the LLM-Link Context Bus (e.g., "ws://localhost:8765").
-            agent_id: The unique identifier of the agent using this bridge.
-        """
-        self.uri = uri
-        self.agent_id = agent_id
+    def __init__(self, host: str, port: int, registry: MemoryRegistry):
+        self.host = host
+        self.port = port
+        self.registry = registry
+        self._server: Optional[websockets.WebSocketServer] = None
         
-        # Internal state
-        self._websocket: Optional[WebSocketClientProtocol] = None
-        self._is_connected: bool = False
-        self._should_reconnect: bool = True
-        self._listener_task: Optional[asyncio.Task] = None
+        # FIX: The clients dictionary must be an instance attribute (self._clients)
+        # It is the core of the routing system.
+        self._clients: ClientRegistry = {}
+        self._clients_lock = asyncio.Lock()
+        logger.info(f"ContextBus initialized to run on {host}:{port}.")
 
-    @property
-    def is_connected(self) -> bool:
-        """Returns True if the WebSocket connection is currently active."""
-        return self._is_connected and self._websocket is not None
+    async def start(self):
+        """Starts the WebSocket server and keeps it running."""
+        logger.info(f"Starting ContextBus server on ws://{self.host}:{self.port}...")
+        
+        # NOTE: Removed the unnecessary local variable assignment 'self_clients = {}' here.
+            
+        try:
+            self._server = await websockets.serve(
+                self._connection_handler,
+                self.host,
+                self.port
+            )
+            logger.info("ContextBus server started successfully.")
+            # Keep the server running indefinitely
+            await asyncio.Future()
+        except OSError as e:
+            logger.error(f"Failed to start server: {e}")
+        except Exception as e:
+            logger.error(f"An unexpected error occurred: {e}")
 
-    def connect(self, message_handler: MessageCallback):
+    async def stop(self):
+        """Stops the WebSocket server gracefully."""
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+            logger.info("ContextBus server stopped.")
+
+    async def _connection_handler(self, websocket: WebSocketServerProtocol, path: str):
         """
-        Starts the connection listener in the background.
-
-        Args:
-            message_handler: The coroutine function to call for every incoming LinkMessage.
+        Handles a new client connection and its entire message lifecycle.
+        
+        This coroutine is created for each new agent that connects.
         """
-        if self._listener_task and not self._listener_task.done():
-            logger.warning(f"[{self.agent_id}] Bridge is already running.")
+        agent_id: Optional[str] = None
+        try:
+            # 1. Wait for the first message, which MUST be AGENT_REGISTER
+            agent_id = await self._register_agent(websocket)
+            if not agent_id:
+                # _register_agent handles closing the connection
+                return
+
+            # 2. Loop and process messages from the registered agent
+            async for raw_message in websocket:
+                try:
+                    message = parse_message(raw_message)
+                    
+                    # Ensure sender_id matches the registered agent
+                    if message.sender_id != agent_id:
+                        logger.warning(f"Sender ID mismatch for {agent_id}. "
+                                     f"Got {message.sender_id}. Ignoring.")
+                        continue
+                        
+                    # Route the message to its destination
+                    await self._route_message(message)
+                    
+                except ValidationError as e:
+                    logger.error(f"Invalid message from {agent_id}: {e}")
+                    # Send an error message back to the sender
+                    await self._send_error(
+                        websocket,
+                        f"Invalid message: {e}",
+                        message.message_id if 'message' in locals() else None
+                    )
+                except Exception as e:
+                    logger.error(f"Error processing message from {agent_id}: {e}", exc_info=True)
+                    await self._send_error(
+                        websocket,
+                        f"Internal server error: {e}",
+                        message.message_id if 'message' in locals() else None
+                    )
+
+        except ConnectionClosed as e:
+            logger.info(f"Agent {agent_id or 'unknown'} disconnected: {e.code} {e.reason}")
+        except Exception as e:
+            logger.error(f"Unhandled error in connection handler for {agent_id}: {e}", exc_info=True)
+        finally:
+            # 3. Cleanup: Unregister the agent and clean session memory
+            if agent_id:
+                await self._unregister_agent(agent_id)
+
+    async def _register_agent(self, websocket: WebSocketServerProtocol) -> Optional[str]:
+        """
+        Handles the initial AGENT_REGISTER message from a new connection.
+        """
+        try:
+            raw_message = await asyncio.wait_for(websocket.recv(), timeout=10.0)
+            message = parse_message(raw_message)
+
+            if message.message_type != MessageType.AGENT_REGISTER:
+                await self._send_error(websocket, "First message must be AGENT_REGISTER", message.message_id)
+                await websocket.close(1002, "Invalid protocol: expected AGENT_REGISTER")
+                return None
+
+            payload = parse_payload(message, AgentRegisterPayload)
+            
+            if payload.protocol_version != PROTOCOL_VERSION:
+                await self._send_error(websocket, f"Protocol version mismatch. Server: {PROTOCOL_VERSION}, Client: {payload.protocol_version}", message.message_id)
+                await websocket.close(1002, "Protocol mismatch")
+                return None
+                
+            agent_id = payload.agent_id
+
+            async with self._clients_lock:
+                # FIX: Use the instance attribute self._clients
+                if agent_id in self._clients: 
+                    logger.warning(f"Agent {agent_id} tried to connect but is already registered. Closing new connection.")
+                    await self._send_error(websocket, f"Agent ID '{agent_id}' already registered.", message.message_id)
+                    await websocket.close(1008, "Agent ID already registered")
+                    return None
+                
+                # Add to registry
+                # FIX: Use the instance attribute self._clients
+                self._clients[agent_id] = websocket 
+                
+            logger.info(f"Agent registered: {agent_id} from {websocket.remote_address}")
+            
+            # Send acknowledgement (e.g., a TASK_RESPONSE to the implicit register task)
+            ack_response = TaskResponsePayload(
+                task_id=message.message_id, # Correlate to the register message
+                status=TaskStatus.SUCCESS,
+                result={"message": f"Agent {agent_id} registered successfully."}
+            )
+            ack_msg = create_message(
+                sender_id="ContextBus",
+                receiver_id=agent_id,
+                message_type=MessageType.TASK_RESPONSE,
+                payload=ack_response,
+                correlation_id=message.message_id
+            )
+            await self._send_message_to_socket(websocket, ack_msg)
+            return agent_id
+
+        except asyncio.TimeoutError:
+            logger.warning("Agent registration timed out. Closing connection.")
+            await websocket.close(1002, "Registration timeout")
+        except ValidationError as e:
+            logger.error(f"Invalid AGENT_REGISTER message: {e}")
+            await self._send_error(websocket, f"Invalid registration payload: {e}")
+            await websocket.close(1002, "Invalid registration payload")
+        except Exception as e:
+            logger.error(f"Error during agent registration: {e}", exc_info=True)
+            await websocket.close(1011, "Server error during registration")
+        
+        return None
+
+    async def _unregister_agent(self, agent_id: str):
+        """Removes an agent from the registry and cleans up its session memory."""
+        async with self._clients_lock:
+            # FIX: Use the instance attribute self._clients
+            if agent_id in self._clients:
+                del self._clients[agent_id]
+                logger.info(f"Agent unregistered: {agent_id}")
+            
+        # Clean up session-level memory
+        cleaned_count = await self.registry.cleanup_session_memory(agent_id)
+        if cleaned_count > 0:
+            logger.info(f"Cleaned up {cleaned_count} session memory entries for {agent_id}.")
+
+    async def _route_message(self, message: LinkMessage):
+        """
+        The core routing logic. Determines where a message should go
+        based on its type and receiver_id.
+        """
+        msg_type = message.message_type
+        
+        if msg_type in (MessageType.TASK_REQUEST, MessageType.TASK_RESPONSE, MessageType.CONTEXT_SHARE):
+            # Direct peer-to-peer or broadcast routing
+            if message.receiver_id == BROADCAST_ID:
+                await self._broadcast(message)
+            else:
+                await self._send_to_agent(message.receiver_id, message)
+                
+        elif msg_type == MessageType.MEMORY_UPDATE:
+            # Handle memory storage
+            await self._handle_memory_update(message)
+            
+        elif msg_type == MessageType.MEMORY_QUERY:
+            # Handle memory retrieval
+            await self._handle_memory_query(message)
+            
+        elif msg_type == MessageType.AGENT_REGISTER:
+            # This should have been handled already, but we'll ignore it
+            logger.warning(f"Received unexpected AGENT_REGISTER from {message.sender_id}")
+            
+        else:
+            # Unhandled message type
+            logger.error(f"Unhandled message type: {msg_type} from {message.sender_id}")
+            await self._send_error_to_agent(
+                agent_id=message.sender_id,
+                error_message=f"Server does not handle message type: {msg_type}",
+                correlation_id=message.message_id
+            )
+
+    async def _send_to_agent(self, agent_id: str, message: LinkMessage):
+        """Sends a LinkMessage to a specific registered agent."""
+        async with self._clients_lock:
+            # FIX: Use the instance attribute self._clients
+            websocket = self._clients.get(agent_id)
+            
+        if websocket:
+            await self._send_message_to_socket(websocket, message)
+        else:
+            logger.warning(f"Agent {agent_id} not found. Message from {message.sender_id} dropped.")
+            # Send an error back to the original sender
+            await self._send_error_to_agent(
+                agent_id=message.sender_id,
+                error_message=f"Receiver agent '{agent_id}' is not connected.",
+                correlation_id=message.message_id
+            )
+
+    async def _broadcast(self, message: LinkMessage):
+        """Broadcasts a message to all connected agents except the sender."""
+        logger.info(f"Broadcasting message from {message.sender_id}")
+        async with self._clients_lock:
+            # Create a list of coroutines to run concurrently
+            tasks = [
+                self._send_message_to_socket(ws, message)
+                # FIX: Use the instance attribute self._clients.items()
+                for client_id, ws in self._clients.items()
+                if client_id != message.sender_id # Don't send back to sender
+            ]
+            await asyncio.gather(*tasks)
+
+    async def _handle_memory_update(self, message: LinkMessage):
+        """Processes a MEMORY_UPDATE message and stores it in the registry."""
+        try:
+            payload = parse_payload(message, MemoryUpdatePayload)
+            # Add sender_id to payload so registry can track session memory
+            payload.owner_id = message.sender_id
+            
+            await self.registry.update_memory(payload)
+            logger.debug(f"Memory updated by {message.sender_id} for key {payload.key}")
+        except ValidationError as e:
+            logger.error(f"Invalid MemoryUpdatePayload from {message.sender_id}: {e}")
+            await self._send_error_to_agent(message.sender_id, f"Invalid payload: {e}", message.message_id)
+        except Exception as e:
+            logger.error(f"Error updating memory: {e}", exc_info=True)
+            await self._send_error_to_agent(message.sender_id, "Internal server error", message.message_id)
+
+    async def _handle_memory_query(self, message: LinkMessage):
+        """Processes a MEMORY_QUERY message, retrieves data, and sends a response."""
+        response_payload = None
+        try:
+            payload = parse_payload(message, MemoryQueryPayload)
+            response_payload = await self.registry.query_memory(payload.key)
+            
+        except ValidationError as e:
+            logger.error(f"Invalid MemoryQueryPayload from {message.sender_id}: {e}")
+            await self._send_error_to_agent(message.sender_id, f"Invalid payload: {e}", message.message_id)
+            return
+        except Exception as e:
+            logger.error(f"Error querying memory: {e}", exc_info=True)
+            await self._send_error_to_agent(message.sender_id, "Internal server error", message.message_id)
             return
 
-        self._should_reconnect = True
-        self._listener_task = asyncio.create_task(
-            self._connection_listener(message_handler)
+        # Send the memory response back to the original querier
+        response_message = create_message(
+            sender_id="ContextBus",
+            receiver_id=message.sender_id,
+            message_type=MessageType.MEMORY_RESPONSE,
+            payload=response_payload,
+            correlation_id=message.message_id
         )
-        logger.info(f"[{self.agent_id}] Bridge started.")
+        await self._send_to_agent(message.sender_id, response_message)
 
-    async def disconnect(self):
-        """
-        Closes the WebSocket connection and stops the connection listener.
-        """
-        logger.info(f"[{self.agent_id}] Disconnecting bridge...")
-        self._should_reconnect = False
-        self._is_connected = False
+    async def _send_error(self, websocket: WebSocketServerProtocol, error_message: str, correlation_id: Optional[str] = None):
+        """Sends a standardized ERROR message over a raw websocket."""
+        error_payload = ErrorPayload(error_message=error_message)
+        error_msg = create_message(
+            sender_id="ContextBus",
+            receiver_id=None, # Receiver is unknown or not yet registered
+            message_type=MessageType.ERROR,
+            payload=error_payload,
+            correlation_id=correlation_id
+        )
+        await self._send_message_to_socket(websocket, error_msg)
 
-        if self._websocket:
-            # Attempt a clean closure
-            try:
-                await self._websocket.close()
-            except Exception as e:
-                logger.debug(f"[{self.agent_id}] Error closing socket: {e}")
-            self._websocket = None
+    async def _send_error_to_agent(self, agent_id: str, error_message: str, correlation_id: Optional[str] = None):
+        """Sends a standardized ERROR message to a registered agent by ID."""
+        error_payload = ErrorPayload(error_message=error_message)
+        error_msg = create_message(
+            sender_id="ContextBus",
+            receiver_id=agent_id,
+            message_type=MessageType.ERROR,
+            payload=error_payload,
+            correlation_id=correlation_id
+        )
+        await self._send_to_agent(agent_id, error_msg)
 
-        if self._listener_task:
-            # Cancel the listener task (which is likely blocked on recv or sleep)
-            self._listener_task.cancel()
-            try:
-                # Wait for the cancellation to complete
-                await self._listener_task
-            except asyncio.CancelledError:
-                # Expected when cancelling
-                pass
-            finally:
-                self._listener_task = None
+    async def _send_message_to_socket(self, websocket: WebSocketServerProtocol, message: LinkMessage):
+        """Safely serializes and sends a LinkMessage over a websocket."""
+        if not websocket or websocket.closed:
+            logger.warning(f"Attempted to send to closed websocket (agent {message.receiver_id}).")
+            return
         
-        logger.info(f"[{self.agent_id}] Bridge disconnected.")
-
-
-    async def _connection_listener(self, message_handler: MessageCallback):
-        """
-        Main loop to maintain the connection, handle reconnections,
-        and listen for incoming messages.
-        """
-        retry_delay = self.initial_retry_delay
-        
-        while self._should_reconnect:
-            try:
-                # 1. Attempt Connection
-                logger.info(f"[{self.agent_id}] Attempting connection to {self.uri}...")
-                
-                # Use a new connection context manager. The `async with` handles closing
-                # the websocket automatically upon exiting the block (success or failure).
-                async with websockets.connect(self.uri, 
-                                              logger=logger,
-                                              close_timeout=5.0) as websocket:
-                    
-                    self._websocket = websocket
-                    self._is_connected = True
-                    logger.info(f"[{self.agent_id}] Connected successfully.")
-                    
-                    # Reset retry delay upon successful connection
-                    retry_delay = self.initial_retry_delay
-
-                    # 2. Main Listen Loop (while connected)
-                    while self._is_connected and self._should_reconnect:
-                        try:
-                            # Wait for a message (this is the blocking call)
-                            raw_message = await self._websocket.recv()
-                            
-                            # Deserialize and validate
-                            message = parse_message(raw_message)
-                            
-                            # Handle message in a non-blocking task to prevent backlog
-                            asyncio.create_task(message_handler(message))
-
-                        except ConnectionClosed as e:
-                            logger.warning(f"[{self.agent_id}] Connection closed gracefully. Code: {e.code}, Reason: {e.reason}")
-                            break # Exit inner listening loop to trigger reconnection logic
-                        except ValidationError as e:
-                            logger.error(f"[{self.agent_id}] Protocol validation failed on incoming message: {e}")
-                            # Keep connection alive, just log the bad message
-                        except Exception as e:
-                            logger.error(f"[{self.agent_id}] Unexpected error during receive: {e}", exc_info=True)
-                            break # Exit inner listening loop to trigger reconnection logic
-
-            except ConnectionRefusedError:
-                logger.error(f"[{self.agent_id}] Connection refused. Retrying in {retry_delay:.1f}s...")
-            except websockets.exceptions.InvalidURI as e:
-                logger.error(f"[{self.agent_id}] Invalid WebSocket URI: {e}. Stopping reconnection.")
-                self._should_reconnect = False # Fatal error
-                break
-            except asyncio.CancelledError:
-                # This exception is expected when disconnect() is called
-                logger.info(f"[{self.agent_id}] Connection listener task cancelled.")
-                self._should_reconnect = False
-                break
-            except Exception as e:
-                logger.error(f"[{self.agent_id}] General connection error: {e}. Retrying in {retry_delay:.1f}s...")
-            
-            finally:
-                # Clean up connection state
-                self._websocket = None 
-                self._is_connected = False
-                
-            # --- Reconnection Logic ---
-            if self._should_reconnect:
-                logger.info(f"[{self.agent_id}] Waiting for {retry_delay:.1f}s before next attempt.")
-                try:
-                    # Wait for the delay or until cancelled by disconnect()
-                    await asyncio.sleep(retry_delay)
-                except asyncio.CancelledError:
-                    logger.info(f"[{self.agent_id}] Retry wait cancelled.")
-                    break # Exit the outer while loop
-                
-                # Exponential backoff
-                retry_delay = min(retry_delay * 2, self.max_retry_delay)
-        
-        logger.info(f"[{self.agent_id}] Connection listener terminated.")
-
-
-    async def send(self, message: LinkMessage) -> bool:
-        """
-        Sends a LinkMessage over the WebSocket connection.
-
-        Args:
-            message: The `LinkMessage` object to send.
-
-        Returns:
-            True if the message was sent successfully, False otherwise.
-        """
-        if not self.is_connected or not self._websocket:
-            logger.error(f"[{self.agent_id}] Cannot send: Not connected.")
-            return False
-
         try:
-            # Serialize the LinkMessage into a JSON string
             json_message = serialize_message(message)
-            await self._websocket.send(json_message)
-            return True
-        except ConnectionClosed as e:
-            logger.error(f"[{self.agent_id}] Failed to send: Connection closed. {e}")
-            self._is_connected = False # Trigger reconnect in the listener
-        except WebSocketException as e:
-            logger.error(f"[{self.agent_id}] Failed to send: WebSocket error. {e}")
+            await websocket.send(json_message)
+        except ConnectionClosed:
+            logger.warning(f"Failed to send to {message.receiver_id}: Connection closed.")
         except Exception as e:
-            logger.error(f"[{self.agent_id}] Failed to serialize or send: {e}")
+            logger.error(f"Error sending message to {message.receiver_id}: {e}", exc_info=True)
 
-        return False
-
-# Define what is exposed when `from .bridge import *` is used
-__all__ = ["WebsocketBridge", "MessageCallback"]
+__all__ = ["ContextBus"]

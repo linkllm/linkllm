@@ -1,28 +1,23 @@
 """
 link_llm.server.registry
-~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~\
 
-This module implements the Memory Registry, which is responsible for
-persistent and session-level storage of context and memory blocks.
-
-It abstracts the storage layer, allowing the Context Bus to manage
-memory through simple asynchronous methods without worrying about
-the underlying database (currently in-memory, designed for later
-expansion to Redis, SQLite, or other persistent storage).
+This module implements the Memory Registry. It has been updated
+to handle agent-specific session memory cleanup.
 """
 
 import asyncio
 import logging
 from typing import Any, Dict, Optional, Tuple, List
 
-# The relative import is correct for the `link_llm` SDK package structure
+# Import from the link_llm package (assuming 'python' dir is in PYTHONPATH)
 from link_llm.protocol import MemoryUpdatePayload, MemoryResponsePayload, MemoryPersistence
 
 logger = logging.getLogger(__name__)
 
 
-# Structure to store memory: (data, persistence)
-MemoryEntry = Tuple[Any, MemoryPersistence]
+# Structure to store memory: (data, persistence, owner_id)
+MemoryEntry = Tuple[Any, MemoryPersistence, Optional[str]]
 
 
 class MemoryRegistry:
@@ -31,6 +26,8 @@ class MemoryRegistry:
 
     This implementation uses a simple in-memory dictionary, protected
     by a Lock for concurrency safety within the asyncio event loop.
+    
+    It now tracks the 'owner' of session-level memory for cleanup.
     """
     
     def __init__(self):
@@ -42,16 +39,23 @@ class MemoryRegistry:
     async def update_memory(self, payload: MemoryUpdatePayload) -> bool:
         """
         Stores or updates a memory block.
+        
+        The `owner_id` from the payload is now used to tag session memory.
         """
+        if not payload.key:
+            logger.warning("Memory update rejected: Key cannot be empty.")
+            return False
+            
+        owner_id = payload.owner_id if payload.persistence == MemoryPersistence.SESSION else None
+        
+        entry: MemoryEntry = (payload.data, payload.persistence, owner_id)
+        
         async with self._lock:
-            try:
-                # Store the raw data and the persistence enum value
-                self._memory[payload.key] = (payload.data, payload.persistence)
-                logger.debug(f"Memory key '{payload.key}' updated with persistence '{payload.persistence.value}'.")
-                return True
-            except Exception as e:
-                logger.error(f"Failed to update memory for key '{payload.key}': {e}")
-                return False
+            self._memory[payload.key] = entry
+            
+        logger.debug(f"Memory key '{payload.key}' updated by {payload.owner_id} "
+                   f"(Persistence: {payload.persistence.value})")
+        return True
 
     async def query_memory(self, key: str) -> MemoryResponsePayload:
         """
@@ -61,8 +65,8 @@ class MemoryRegistry:
             entry = self._memory.get(key)
             
             if entry is not None:
-                data, persistence = entry
-                logger.debug(f"Memory key '{key}' found (Persistence: {persistence.value}).")
+                data, persistence, owner = entry
+                logger.debug(f"Memory key '{key}' found (Persistence: {persistence.value}, Owner: {owner}).")
                 return MemoryResponsePayload(
                     key=key,
                     found=True,
@@ -76,20 +80,27 @@ class MemoryRegistry:
                     data=None
                 )
     
-    async def cleanup_session_memory(self) -> int:
+    async def cleanup_session_memory(self, agent_id: str) -> int:
         """
-        Removes all memory blocks with SESSION persistence.
+        Removes all memory blocks with SESSION persistence
+        owned by a specific agent_id.
+        
+        This is called by the ContextBus when an agent disconnects.
         """
+        if not agent_id:
+            return 0
+            
         async with self._lock:
             keys_to_delete = [
-                key for key, (_, persistence) in self._memory.items()
-                if persistence == MemoryPersistence.SESSION
+                key for key, (_, persistence, owner) in self._memory.items()
+                if persistence == MemoryPersistence.SESSION and owner == agent_id
             ]
             
             for key in keys_to_delete:
                 del self._memory[key]
                 
-            logger.info(f"Cleaned up {len(keys_to_delete)} session memory entries.")
+            if keys_to_delete:
+                logger.info(f"Cleaned up {len(keys_to_delete)} session memory entries for agent {agent_id}.")
             return len(keys_to_delete)
 
     async def get_all_keys(self) -> List[str]:
