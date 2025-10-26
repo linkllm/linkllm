@@ -14,6 +14,7 @@ Key components:
 :license: MIT, see LICENSE for more details.
 """
 
+# Import core models and enums from the protocol module
 from .protocol import (
     LinkMessage,
     MessageType,
@@ -23,7 +24,11 @@ from .protocol import (
     BROADCAST_ID,
     PROTOCOL_VERSION
 )
+
+# Import the bridge components
 from .bridge import WebsocketBridge, MessageCallback
+
+# Import the client components
 from .client import LinkClient, TaskHandler
 
 
@@ -48,4 +53,4 @@ __all__ = [
 ]
 
 # Set the version of the SDK
-__version__ = "0.1.0-alpha"
+__version__ = "0.1.0"
