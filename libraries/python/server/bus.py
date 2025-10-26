@@ -11,7 +11,7 @@ ensuring communication adheres strictly to the LLM-Link Protocol.
 
 import asyncio
 import logging
-from typing import Dict, Optional, Set
+from typing import Tuple, Dict, Optional, Set
 
 # Use 'websockets' for the server implementation
 try:
